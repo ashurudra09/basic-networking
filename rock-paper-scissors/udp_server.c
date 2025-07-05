@@ -5,9 +5,12 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdbool.h>
 
-// Function to compare moves, identical to the TCP server's version.
-void rps_compare(char buffer[3][1024]){
+#define MAX_CLIENTS 2
+
+// (rps_compare function is identical to TCP version, can be included here)
+void rps_compare(char buffer[MAX_CLIENTS][1024]){
     if(strcmp(buffer[0], "r") == 0){
         if(strcmp(buffer[1], "r") == 0){ strcpy(buffer[0], "DRAW"); strcpy(buffer[1], "DRAW"); }
         else if(strcmp(buffer[1], "p") == 0){ strcpy(buffer[0], "LOSE"); strcpy(buffer[1], "WIN"); }
@@ -36,6 +39,12 @@ void rps_compare(char buffer[3][1024]){
     }
 }
 
+// Function to check if two sockaddr_in are the same
+bool is_same_addr(struct sockaddr_in *addr1, struct sockaddr_in *addr2) {
+    return addr1->sin_addr.s_addr == addr2->sin_addr.s_addr &&
+           addr1->sin_port == addr2->sin_port;
+}
+
 int main(int argc, char **argv){
     if (argc != 2){
         printf("Usage: %s <port>\n", argv[0]);
@@ -44,27 +53,26 @@ int main(int argc, char **argv){
 
     char *ip = "127.0.0.1";
     int port = atoi(argv[1]);
-    int rps = 0; // State flag: 0 for initial contact/play again, 1 for RPS move
 
     int sockfd;
-    struct sockaddr_in server_addr, client_addr[2]; // Store addresses for two clients
-    char buffer[3][1024]; // Buffers for messages from two clients
-    socklen_t addr_size;
+    struct sockaddr_in server_addr, client_addrs[MAX_CLIENTS];
+    struct sockaddr_in temp_addr; // To receive incoming packet's address
+    char client_buffers[MAX_CLIENTS][1024];
+    bool client_has_moved[MAX_CLIENTS] = {false, false};
+    int client_count = 0;
+    bool play_again_phase = false;
 
-    // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0){
         perror("[-]socket error");
         exit(1);
     }
 
-    // Configure server address
     memset(&server_addr, '\0', sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     server_addr.sin_addr.s_addr = inet_addr(ip);
 
-    // Bind socket to the address and port
     if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("[-]bind error");
         exit(1);
@@ -72,52 +80,71 @@ int main(int argc, char **argv){
     printf("UDP Server is listening on port %d...\n", port);
 
     while(1){
-        // Sequentially wait for two packets. This is a blocking operation.
-        // The server assumes two different clients will send packets one after another.
-        for(int i = 0; i < 2; i++){
-            bzero(buffer[i], 1024);
-            addr_size = sizeof(client_addr[i]);
-            if (recvfrom(sockfd, buffer[i], 1024, 0, (struct sockaddr *) &client_addr[i], &addr_size) < 0) {
-                perror("recvfrom");
-                exit(1);
+        // Wait until we have two clients and both have sent a move
+        while (!(client_count == MAX_CLIENTS && client_has_moved[0] && client_has_moved[1])) {
+            char temp_buffer[1024];
+            bzero(temp_buffer, 1024);
+            socklen_t addr_size = sizeof(temp_addr);
+            
+            int bytes_received = recvfrom(sockfd, temp_buffer, 1023, 0, (struct sockaddr *)&temp_addr, &addr_size);
+            if (bytes_received < 0) {
+                perror("recvfrom error");
+                continue;
             }
-            printf("[+]Data recv from client %d: %s\n", i+1, buffer[i]);
+
+            int client_index = -1;
+            // Check if this client is already known
+            for (int i = 0; i < client_count; i++) {
+                if (is_same_addr(&client_addrs[i], &temp_addr)) {
+                    client_index = i;
+                    break;
+                }
+            }
+
+            // If it's a new client and we have space
+            if (client_index == -1 && client_count < MAX_CLIENTS) {
+                client_index = client_count;
+                client_addrs[client_index] = temp_addr;
+                client_count++;
+                printf("[+] New client %d registered.\n", client_count);
+            }
+
+            // If we know the client, process their move
+            if (client_index != -1) {
+                strcpy(client_buffers[client_index], temp_buffer);
+                client_has_moved[client_index] = true;
+                printf("[+] Received from client %d: %s\n", client_index + 1, client_buffers[client_index]);
+            }
         }
 
-        // If the state flag 'rps' is 1, it means the received packets are game moves
-        if(rps == 1){
-            rps_compare(buffer); // Determine the winner
-            rps = 0; // Reset state to wait for "play again" response
-        }
-        // If this is the first contact from both clients
-        else if (strcmp(buffer[0], "Hello!") == 0 && strcmp(buffer[1], "Hello!") == 0) {
-            strcpy(buffer[0], "Hello! lets begin. choose r/p/s");
-            strcpy(buffer[1], "Hello! lets begin. choose r/p/s");
-            rps = 1; // Set state to expect game moves next
-        }
-        // Otherwise, the packets are responses to "play again?"
-        else{
-            // If both want to play again
-            if(strcmp(buffer[0], "y") == 0 && strcmp(buffer[1], "y") == 0){
-                strcpy(buffer[0], "Okay then, Lets play again!");
-                strcpy(buffer[1], "Okay then, Lets play again!");
+        // --- Game Logic Processing ---
+        if (play_again_phase) {
+            if (strcmp(client_buffers[0], "y") == 0 && strcmp(client_buffers[1], "y") == 0) {
+                char *msg = "Next round! Choose r/p/s:";
+                sendto(sockfd, msg, strlen(msg), 0, (struct sockaddr *)&client_addrs[0], sizeof(client_addrs[0]));
+                sendto(sockfd, msg, strlen(msg), 0, (struct sockaddr *)&client_addrs[1], sizeof(client_addrs[1]));
+            } else {
+                char *msg = "Okay then, goodbye!";
+                sendto(sockfd, msg, strlen(msg), 0, (struct sockaddr *)&client_addrs[0], sizeof(client_addrs[0]));
+                sendto(sockfd, msg, strlen(msg), 0, (struct sockaddr *)&client_addrs[1], sizeof(client_addrs[1]));
+                // Reset for new players
+                client_count = 0;
             }
-            // If at least one does not want to play again
-            else {
-                strcpy(buffer[0], "Okay then, Goodbye!");
-                strcpy(buffer[1], "Okay then, Goodbye!");
-            }
-            rps = 1; // Set state to expect game moves next (or clients will exit)
+            play_again_phase = false;
+        } else {
+            rps_compare(client_buffers);
+            sendto(sockfd, client_buffers[0], strlen(client_buffers[0]), 0, (struct sockaddr *)&client_addrs[0], sizeof(client_addrs[0]));
+            sendto(sockfd, client_buffers[1], strlen(client_buffers[1]), 0, (struct sockaddr *)&client_addrs[1], sizeof(client_addrs[1]));
+            
+            char *msg = "Play again? (y/n)";
+            sendto(sockfd, msg, strlen(msg), 0, (struct sockaddr *)&client_addrs[0], sizeof(client_addrs[0]));
+            sendto(sockfd, msg, strlen(msg), 0, (struct sockaddr *)&client_addrs[1], sizeof(client_addrs[1]));
+            play_again_phase = true;
         }
 
-        // Send the appropriate response back to each client using their stored address
-        for(int i = 0; i < 2; i++){
-            if (sendto(sockfd, buffer[i], 1024, 0, (struct sockaddr *) &client_addr[i], sizeof(client_addr[i])) < 0) {
-                perror("sendto");
-                exit(1);
-            }
-            printf("[+]Data send to client %d: %s\n", i+1, buffer[i]);
-        }
+        // Reset move flags for the next round
+        client_has_moved[0] = false;
+        client_has_moved[1] = false;
     }
     return 0;
 }

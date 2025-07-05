@@ -50,7 +50,7 @@ This project demonstrates how to build a reliable data transfer protocol on top 
 
 #### Key Files
 -   `tcp-from-udp/tcp_scratch.h`: A header file defining the packet structure and protocol constants.
--   `tcp-from-udp/udp_client_B.c` & `udp_server_B.c`: Identical source files for the peer program.
+-   `tcp-from-udp/udp_client.c` & `udp_server.c`: Identical source files for the peer program.
 
 #### Core Concepts
 
@@ -141,3 +141,5 @@ This project demonstrates how to build a reliable data transfer protocol on top 
     make clean
     ```
     Then, navigate back to the root directory: `cd ..`
+
+---

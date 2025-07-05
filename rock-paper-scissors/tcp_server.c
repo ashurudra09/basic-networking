@@ -7,8 +7,10 @@
 #include <errno.h>
 #include <stdbool.h>
 
+#define MAX_CLIENTS 2
+
 // Function to compare the moves of two players and determine the outcome
-void rps_compare(char buffer[100][1024]){
+void rps_compare(char buffer[MAX_CLIENTS][1024]){
     // Check if player 1 chose 'r' (rock)
     if(strcmp(buffer[0], "r") == 0){
         if(strcmp(buffer[1], "r") == 0){ strcpy(buffer[0], "DRAW"); strcpy(buffer[1], "DRAW"); }
@@ -42,18 +44,35 @@ void rps_compare(char buffer[100][1024]){
     }
 }
 
+
+// Function to reset the game state
+void reset_game(int *client_sockets, int *client_count, bool *client_has_moved) {
+    for (int i = 0; i < *client_count; i++) {
+        if (client_sockets[i] != -1) {
+            close(client_sockets[i]);
+            printf("[+]Client on socket %d disconnected.\n", client_sockets[i]);
+        }
+        client_sockets[i] = -1;
+    }
+    *client_count = 0;
+    client_has_moved[0] = false;
+    client_has_moved[1] = false;
+    printf("\n--- Game Reset: Waiting for 2 new players ---\n");
+}
+
 int main(){
     char *ip = "127.0.0.1";
     int port = 5566;
 
     int server_sock;
-    int client_sock[100]; // Array to hold client socket descriptors
-    int client_num = 0;   // Counter for connected clients
+    int client_sockets[MAX_CLIENTS] = {-1, -1};
+    int client_count = 0;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_size;
-    char buffer[100][1024]; // Buffer to hold messages from clients
+    char client_buffers[MAX_CLIENTS][1024];
+    bool client_has_moved[MAX_CLIENTS] = {false, false};
+    bool play_again_phase = false;
 
-    // Create TCP socket
     server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0){
         perror("[-]Socket error");
@@ -61,105 +80,121 @@ int main(){
     }
     printf("[+]TCP server socket created.\n");
 
-    // Configure server address
     memset(&server_addr, '\0', sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = port;
+    server_addr.sin_port = htons(port);
     server_addr.sin_addr.s_addr = inet_addr(ip);
 
-    // Bind socket to the specified IP and port
     if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0){
         perror("[-]Bind error");
         exit(1);
     }
     printf("[+]Bind to the port number: %d\n", port);
 
-    // Listen for incoming connections
     listen(server_sock, 5);
-    printf("Listening...\n");
+    printf("Listening for connections...\n");
 
-    bool another = false; // Flag to check if we are in the "play again?" phase
+    struct pollfd fds[MAX_CLIENTS + 1];
+
     while(1){
-        // Use poll to check for new connections without blocking the main loop
-        struct pollfd fds[1];
+        // Setup pollfd array
         fds[0].fd = server_sock;
-        fds[0].events = POLLIN; // Check for incoming data (i.e., new connections)
-
-        poll(fds, 1, 20); // Wait for 20ms for an event
-
-        // If a new connection is pending, accept it
-        if(fds[0].revents & POLLIN) {
-            client_sock[client_num++] = accept(server_sock, (struct sockaddr *) &client_addr, &addr_size);
-            printf("[+]Client%d connected.\n", client_num);
-            if(client_num == 2){
-                printf("Ready! Lets play!\n");
-            }
-            continue; // Go back to the start of the loop to check for more connections or start the game
-        }
-        
-        // Do not proceed with the game until two clients are connected
-        if(client_num < 2){
-            continue;
-        }
-        
-        // Receive messages from both clients (this part is blocking)
-        for(int i = 0; i < client_num; i++) {
-            bzero(buffer[i], 1024);
-            int c = recv(client_sock[i], buffer[i], sizeof(buffer[i]), MSG_NOSIGNAL);
-            if (c <= 0) { // If recv returns 0 or less, client has disconnected
-                printf("[-]Client%d disconnected unexpectedly.\n", i + 1);
-                close(client_sock[i]);
-                // Simple reset logic: disconnect the other client and wait for new players
-                close(client_sock[1-i]);
-                client_num = 0;
-                another = false;
-                printf("Resetting game. Waiting for 2 new players.\n");
-                break;
-            }
-            printf("Client%d: %s\n", i + 1, buffer[i]);
-        }
-        if (client_num < 2) continue; // If a client disconnected, restart the loop
-
-        // Handle the "play again?" logic
-        if(another) {
-            // If both clients respond with 'y'
-            if (strcmp(buffer[0], "y") == 0 && strcmp(buffer[1], "y") == 0){
-                another = false; // Reset the flag for the next round
-                char* next_round_msg = "Cool! lets play another!";
-                printf("Server: %s\n", next_round_msg);
-                send(client_sock[0], next_round_msg, strlen(next_round_msg), MSG_NOSIGNAL);
-                send(client_sock[1], next_round_msg, strlen(next_round_msg), MSG_NOSIGNAL);
-                continue; // Start the next round
-            }
-            // If either client does not respond with 'y'
-            else{
-                printf("Server: Okay then, goodbye!\n");
-                send(client_sock[0], "Okay then, goodbye!", 20, MSG_NOSIGNAL);
-                send(client_sock[1], "Okay then, goodbye!", 20, MSG_NOSIGNAL);
-                // Disconnect both clients
-                close(client_sock[0]);
-                printf("[+]Client1 disconnected.\n\n");
-                close(client_sock[1]);
-                printf("[+]Client2 disconnected.\n\n");
-                // Reset server state to wait for new players
-                client_num = 0;
-                another = false;
-                continue;
+        fds[0].events = POLLIN;
+        int active_fds = 1;
+        for (int i = 0; i < client_count; i++) {
+            if (client_sockets[i] != -1) {
+                fds[active_fds].fd = client_sockets[i];
+                fds[active_fds].events = POLLIN;
+                active_fds++;
             }
         }
 
-        // Main game logic for a round
-        if(client_num > 1){
-            rps_compare(buffer); // Determine the winner
-            
-            // Send the results to each client
-            send(client_sock[0], buffer[0], strlen(buffer[0]), MSG_NOSIGNAL);
-            send(client_sock[1], buffer[1], strlen(buffer[1]), MSG_NOSIGNAL);
-            
-            // Set the flag to indicate the next input will be for "play again?"
-            another = true;
-            printf("Server: Round over. Asking players to play again.\n");
+        // Wait for activity on any socket
+        int poll_count = poll(fds, active_fds, -1); // -1 for infinite timeout
+        if (poll_count < 0) {
+            perror("[-]Poll error");
+            break;
+        }
+
+        // Check for new connections on the listening socket
+        if (fds[0].revents & POLLIN) {
+            if (client_count < MAX_CLIENTS) {
+                addr_size = sizeof(client_addr);
+                int new_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addr_size);
+                if (new_sock < 0) {
+                    perror("[-]Accept error");
+                } else {
+                    client_sockets[client_count] = new_sock;
+                    client_count++;
+                    printf("[+]Client %d connected on socket %d.\n", client_count, new_sock);
+                    if (client_count == MAX_CLIENTS) {
+                        printf("--- Two players connected! Starting game. ---\n");
+                        char *start_msg = "Game start! Choose rock (r), paper (p), or scissors (s):";
+                        send(client_sockets[0], start_msg, strlen(start_msg), 0);
+                        send(client_sockets[1], start_msg, strlen(start_msg), 0);
+                    }
+                }
+            }
+        }
+
+        // Check for data from connected clients
+        for (int i = 1; i < active_fds; i++) {
+            if (fds[i].revents & POLLIN) {
+                int client_index = -1;
+                for (int j = 0; j < client_count; j++) {
+                    if (client_sockets[j] == fds[i].fd) {
+                        client_index = j;
+                        break;
+                    }
+                }
+
+                if (client_index != -1) {
+                    bzero(client_buffers[client_index], 1024);
+                    int bytes_received = recv(client_sockets[client_index], client_buffers[client_index], 1023, 0);
+
+                    if (bytes_received <= 0) { // Client disconnected or error
+                        printf("[-]Client %d on socket %d disconnected or had an error.\n", client_index + 1, client_sockets[client_index]);
+                        reset_game(client_sockets, &client_count, client_has_moved);
+                        play_again_phase = false;
+                        break; // Restart poll loop
+                    }
+
+                    printf("Client %d: %s\n", client_index + 1, client_buffers[client_index]);
+                    client_has_moved[client_index] = true;
+                }
+            }
+        }
+
+        // If we have 2 clients and both have made a move, process the game logic
+        if (client_count == MAX_CLIENTS && client_has_moved[0] && client_has_moved[1]) {
+            if (play_again_phase) {
+                if (strcmp(client_buffers[0], "y") == 0 && strcmp(client_buffers[1], "y") == 0) {
+                    char *next_round_msg = "Next round! Choose rock (r), paper (p), or scissors (s):";
+                    send(client_sockets[0], next_round_msg, strlen(next_round_msg), 0);
+                    send(client_sockets[1], next_round_msg, strlen(next_round_msg), 0);
+                } else {
+                    char *goodbye_msg = "Okay then, goodbye!";
+                    send(client_sockets[0], goodbye_msg, strlen(goodbye_msg), 0);
+                    send(client_sockets[1], goodbye_msg, strlen(goodbye_msg), 0);
+                    reset_game(client_sockets, &client_count, client_has_moved);
+                }
+                play_again_phase = false;
+            } else {
+                rps_compare(client_buffers);
+                send(client_sockets[0], client_buffers[0], strlen(client_buffers[0]), 0);
+                send(client_sockets[1], client_buffers[1], strlen(client_buffers[1]), 0);
+
+                char *play_again_msg = "Play again? (y/n)";
+                send(client_sockets[0], play_again_msg, strlen(play_again_msg), 0);
+                send(client_sockets[1], play_again_msg, strlen(play_again_msg), 0);
+                play_again_phase = true;
+            }
+
+            // Reset move flags for the next round
+            client_has_moved[0] = false;
+            client_has_moved[1] = false;
         }
     }
+    close(server_sock);
     return 0;
 }
